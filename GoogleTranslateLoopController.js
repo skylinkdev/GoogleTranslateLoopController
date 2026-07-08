@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Translate 循环朗读
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  在 Google Translate 添加循环朗读按钮 (右侧悬浮按钮 / Ctrl+L 弹出界面)
 // @author       You
 // @match        https://translate.google.com/*
@@ -15,15 +15,20 @@
     'use strict';
 
     let isLooping        = false;
-    let loopInterval     = null;
+    let loopTimer        = null;
+    let playbackSafetyTimer   = null;
+    let resolvePlaybackWait   = null;
+    let audioPlaybackHookInstalled = false;
+    let loopRunId        = 0;
+    let loopPhase        = 'idle';
     let controlPanel     = null;
-    let intervalTime     = 4000;   // 毫秒
+    let playbackIntervalTime = 4000;   // 间隔播放时间：播放结束后等待多久再播放下一轮，单位毫秒
     let selectedButtonIndex = null;
     let speakButtons     = [];
     let floatingBtn      = null;
     let fabLabel         = null;
 
-    console.log('[循环朗读] 脚本已加载 v4.1');
+    console.log('[循环朗读] 脚本已加载');
 
     // ─── 注入 CSS（用 textContent，不触发 Trusted Types）─────────────────
     function injectStyles() {
@@ -279,18 +284,18 @@
         }
         panel.appendChild(selectSection);
 
-        // 间隔时间
+        // 间隔播放时间
         const intervalDiv = el('div', 'margin-bottom:22px;');
         intervalDiv.appendChild(el('label', [
             'display:block', 'margin-bottom:8px', 'font-size:13px',
             'color:#5f6368', 'font-weight:600',
             'text-transform:uppercase', 'letter-spacing:.5px'
-        ].join(';'), '朗读间隔时间 (秒):'));
+        ].join(';'), '间隔播放时间 (秒):'));
 
         const intervalInput = document.createElement('input');
         intervalInput.type  = 'number';
         intervalInput.id    = 'interval-input';
-        intervalInput.value = intervalTime / 1000;
+        intervalInput.value = playbackIntervalTime / 1000;
         intervalInput.min   = '1';
         intervalInput.max   = '60';
         intervalInput.style.cssText = [
@@ -303,8 +308,8 @@
         intervalInput.addEventListener('change', e => {
             const v = parseInt(e.target.value) * 1000;
             if (v >= 1000 && v <= 60000) {
-                intervalTime = v;
-                if (isLooping) { stopLoop(); startLoop(); }
+                playbackIntervalTime = v;
+                updatePanelStatus();
             }
         });
         intervalDiv.appendChild(intervalInput);
@@ -383,7 +388,7 @@
             const desc = selectedButtonIndex !== null
                 ? getButtonDescription(speakButtons[selectedButtonIndex], selectedButtonIndex)
                 : '未选择';
-            statusDiv.textContent        = '状态: 循环中 ✔  (' + desc + '，每 ' + (intervalTime / 1000) + ' 秒)';
+            statusDiv.textContent        = '状态: 循环中 ✔  (' + desc + '，播放结束后等待 ' + (playbackIntervalTime / 1000) + ' 秒)';
             statusDiv.style.background   = '#e8f5e9';
             statusDiv.style.color        = '#34a853';
             toggleBtn.textContent        = '⏹️ 停止循环';
@@ -398,6 +403,86 @@
     }
 
     // ─── 循环逻辑 ────────────────────────────────────────────────────────
+    function clearLoopTimer() {
+        if (loopTimer) {
+            clearTimeout(loopTimer);
+            loopTimer = null;
+        }
+    }
+
+    function installAudioPlaybackHook() {
+        if (audioPlaybackHookInstalled) return;
+
+        const contextConstructors = [window.AudioContext, window.webkitAudioContext].filter(Boolean);
+        const hookedPrototypes = new Set();
+
+        contextConstructors.forEach(ContextCtor => {
+            const proto = ContextCtor && ContextCtor.prototype;
+            if (!proto || hookedPrototypes.has(proto) || typeof proto.createBufferSource !== 'function') return;
+
+            const originalCreateBufferSource = proto.createBufferSource;
+            proto.createBufferSource = function (...args) {
+                const source = originalCreateBufferSource.apply(this, args);
+
+                source.addEventListener('ended', () => {
+                    console.log('[循环朗读] 播放结束');
+                    finishPlaybackWait();
+                });
+
+                return source;
+            };
+
+            hookedPrototypes.add(proto);
+        });
+
+        audioPlaybackHookInstalled = hookedPrototypes.size > 0;
+        console.log(audioPlaybackHookInstalled ? '[循环朗读] Hook成功' : '[循环朗读] Hook失败：当前页面不支持 AudioContext');
+    }
+
+    function cleanupPlaybackWait() {
+        if (playbackSafetyTimer) {
+            clearTimeout(playbackSafetyTimer);
+            playbackSafetyTimer = null;
+        }
+        resolvePlaybackWait = null;
+        loopPhase = 'idle';
+    }
+
+    function finishPlaybackWait() {
+        if (!resolvePlaybackWait) return;
+        const resolve = resolvePlaybackWait;
+        cleanupPlaybackWait();
+        resolve();
+    }
+
+    function observePlaybackEnd() {
+        cleanupPlaybackWait();
+        installAudioPlaybackHook();
+
+        return new Promise(resolve => {
+            resolvePlaybackWait = resolve;
+            loopPhase = 'waiting-audio-ended';
+
+            // 兜底：如果 Google 页面没有触发 AudioBufferSourceNode ended，避免循环永久卡住。
+            playbackSafetyTimer = setTimeout(finishPlaybackWait, 60000);
+        });
+    }
+
+    function waitPlaybackInterval(runId) {
+        return new Promise(resolve => {
+            if (!isLooping || runId !== loopRunId) {
+                resolve();
+                return;
+            }
+
+            loopPhase = 'interval';
+            loopTimer = setTimeout(() => {
+                loopTimer = null;
+                resolve();
+            }, playbackIntervalTime);
+        });
+    }
+
     function clickSelectedSpeakButton() {
         if (selectedButtonIndex !== null && speakButtons[selectedButtonIndex]) {
             speakButtons[selectedButtonIndex].click();
@@ -409,12 +494,44 @@
         isLooping = !isLooping;
         if (isLooping) startLoop(); else stopLoop();
     }
-    function startLoop() {
-        clickSelectedSpeakButton();
-        loopInterval = setInterval(() => { if (isLooping) clickSelectedSpeakButton(); }, intervalTime);
+
+    async function runLoop(runId) {
+        while (isLooping && runId === loopRunId) {
+            const btn = selectedButtonIndex !== null ? speakButtons[selectedButtonIndex] : null;
+            if (!btn || !document.contains(btn)) {
+                stopLoop();
+                updatePanelStatus();
+                updateFloatingButton();
+                return;
+            }
+
+            const playbackDone = observePlaybackEnd();
+            loopPhase = 'clicking';
+            if (!clickSelectedSpeakButton()) {
+                stopLoop();
+                updatePanelStatus();
+                updateFloatingButton();
+                return;
+            }
+            loopPhase = 'playing';
+
+            await playbackDone;
+            await waitPlaybackInterval(runId);
+        }
     }
-    function stopLoop() {
-        if (loopInterval) { clearInterval(loopInterval); loopInterval = null; }
+
+    function startLoop() {
+        stopLoop(false);
+        isLooping = true;
+        loopRunId += 1;
+        runLoop(loopRunId);
+    }
+
+    function stopLoop(updateState = true) {
+        if (updateState) isLooping = false;
+        loopRunId += 1;
+        clearLoopTimer();
+        cleanupPlaybackWait();
     }
 
     // ─── 事件绑定 ────────────────────────────────────────────────────────
@@ -428,6 +545,7 @@
 
     // ─── 初始化 ──────────────────────────────────────────────────────────
     injectStyles();
+    installAudioPlaybackHook();
     createFloatingButton();
     console.log('[循环朗读] 初始化完成 — 右侧按钮 或 Ctrl+L 打开面板');
 })();
